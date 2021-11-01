@@ -4,7 +4,7 @@ import ska_helpers
 
 __version__ = ska_helpers.get_version(__package__)
 
-from .clean import clean_file, clean_img
+from .clean import clean_files, clean_imgs # noqa
 
 
 def test(*args, **kwargs):

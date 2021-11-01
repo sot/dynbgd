@@ -1,8 +1,7 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 import numpy as np
 from collections import defaultdict
-from itertools import count
-from astropy.table import Table
+from astropy.table import Table, vstack
 from astropy.io import fits
 
 from chandra_aca.aca_image import ACAImage
@@ -57,7 +56,7 @@ def get_pix_estimates(pix_vals, pix_times, times, image_readout_period=4.1, seed
         # this i if there aren't enough samples.
         if (times_pix[i + 2] - times_pix[i - 2]) < (5.5 * image_readout_period):
             times_filtered.append(times_pix[i])
-            values_filtered.append(np.median(vals_pix[i-2:i+2]))
+            values_filtered.append(np.median(vals_pix[i - 2:i + 2]))
 
     # Linearly interpolate the filtered data
     return np.interp(x=times, xp=times_filtered, fp=values_filtered)
@@ -106,19 +105,13 @@ def get_estimated_backgrounds(imgs, ccd_bgd=None):
                            img.meta['IMGCOL0'] + c)
                 if dat_idx in est_dark:
                     bg[r, c] = est_dark[dat_idx][i]
+
+        bg.meta['TIME'] = img.meta['TIME'].copy()
         bgs.append(bg.copy())
     return bgs
 
 
-def clean_imgs(dat, t_ccd=-8):
-    """
-    Calculate and subtract dynamic background from 'img_raw' images in an astropy
-    table from the adat1 fits file.
-
-    :param data: astropy table of adat1 file including img_raw, img_row0, and img_col0
-    :param t_ccd: temperature to use for dark cal used as seed
-    :returns: list of raw ACAImages with dynamic background subtracted (in DN)
-    """
+def get_background_imgs(dat, t_ccd=-8):
     imgs = []
 
     imgsize = dat['img_raw'].shape[1]
@@ -145,35 +138,76 @@ def clean_imgs(dat, t_ccd=-8):
     ccd_bgd /= 5
 
     # Calculate dynamic background for each img
-    bgds = get_estimated_backgrounds(imgs, ccd_bgd=ccd_bgd)
+    return get_estimated_backgrounds(imgs, ccd_bgd=ccd_bgd)
+
+
+def clean_imgs(dat, bgs):
+    """
+    Calculate and subtract dynamic background from 'img_raw' images in an astropy
+    table from the adat1 fits file.
+
+    :param data: astropy table of adat1 file including img_raw, img_row0, and img_col0
+    :param t_ccd: temperature to use for dark cal used as seed
+    :returns: list of raw ACAImages with dynamic background subtracted (in DN)
+    """
+
+    # This is now duplicated...
+    # Convert img_raw column in table to list of ACAImages
+    imgs = []
+    for i, row in enumerate(dat):
+        imgraw = np.ones((8, 8)) * np.nan
+        imgraw[:] = np.array(row['img_raw'])
+        meta = {name: row[name] for name in row.colnames}
+        meta['IMGROW0'] = row['img_row0']
+        meta['IMGCOL0'] = row['img_col0']
+        meta['TIME'] = row['time']
+        img = ACAImage(imgraw, meta=meta)
+        imgs.append(img)
+
+    times = [bg.meta['TIME'] for bg in bgs]
 
     # Subtract dynamic background without oversubtraction
     bg_sub = np.ones(dat['img_raw'].shape) * np.nan
-    for i, img, bgd in zip(count(), imgs, bgds):
-        bg_sub[i] = np.clip(img - bgd, a_min=0, a_max=None)
-
+    for i, img in enumerate(imgs):
+        idx = np.searchsorted(times, img.meta['TIME'])
+        bg_sub[i] = np.clip(img - bgs[idx], a_min=0, a_max=None)
     return bg_sub
 
 
-def clean_file(file, t_ccd=-8):
+def clean_files(files, t_ccd=-8):
     """
-    Read raw images in DN from the 'img_raw' column of `file` and
+    Read raw images in DN from the 'img_raw' column of `files` and
     write back dynamic-background subtracted images in e- to 'img_corr'
-    column of the same file.
+    column of the same files.
 
-    :param file: L1 ADAT file (from before calculate_centroids)
+    :param files: L1 ADAT files (from before calculate_centroids) of a single image slot
     :param t_ccd: t_ccd to be used for seed dark current
     """
-    dat = Table.read(file)
-    # Get cleaned images
-    imgs_raw = clean_imgs(dat, t_ccd=t_ccd)
-    if len(imgs_raw) == 0:
-        return
+    # Make sure the files are all 8x8
+    okfiles = []
+    for file in files:
+        dat = Table.read(file)
+        if dat['img_raw'].shape[1] == 8:
+            okfiles.append(file)
 
-    # Convert DN to e-
-    imgs_corr = [img * 5 for img in imgs_raw]
+    # Read into one stack
+    dat = vstack([Table.read(file)['time', 'img_row0', 'img_col0', 'img_raw']
+                  for file in okfiles], metadata_conflicts='silent')
 
-    # Write out to img_corr column
-    hdu = fits.open(file)
-    hdu[1].data['img_corr'] = imgs_corr
-    hdu.writeto(file, overwrite=True)
+    # Get background images
+    bgs = get_background_imgs(dat, t_ccd=t_ccd)
+
+    # Then background subtract on a per-file basis.
+    for file in okfiles:
+        fdat = Table.read(file)
+        imgs_raw_cleaned = clean_imgs(fdat, bgs)
+        if len(imgs_raw_cleaned) == 0:
+            continue
+
+        # Convert DN to e-
+        imgs_corr = [img * 5 for img in imgs_raw_cleaned]
+
+        # Write out to img_corr column
+        hdu = fits.open(file)
+        hdu[1].data['img_corr'] = imgs_corr
+        hdu.writeto(file, overwrite=True)
